@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  FibonacciFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      InlineCode: |
+        exports.handler = async (event) => {
+          // Get parameters from event
+          const number = event.number || 0;
+          const userName = event.userName || 'anonymous';
+          
+          // Log the incoming event and user
+          console.log('Event received from user:', userName, 'Event:', JSON.stringify(event));
+          
+          // Random log message
+          console.log('Processing Fibonacci calculation at:', new Date().toISOString());
+          
+          // Validate input
+          if (number < 0) {
+            const errorMessage = `User ${userName} requested Fibonacci of negative number: ${number}`;
+            console.error(errorMessage);
+            throw new Error(errorMessage);
+          }
+          
+          // Sleep for 1 second
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Calculate Fibonacci
+          const calculateFibonacci = (n) => {
+            if (n <= 1) return n;
+            return calculateFibonacci(n - 1) + calculateFibonacci(n - 2);
+          };
+          
+          const result = calculateFibonacci(number);
+          
+          // Log and return the result
+          console.log('Calculated Fibonacci result:', result);
+          
+          // Clear memory
+          
+          return {
+            statusCode: 200,
+            body: JSON.stringify({
+              userName,
+              input: number,
+              fibonacci: result
+            })
+          };
+        };
+      Description: A Lambda function that calculates Fibonacci numbers
+      MemorySize: 128
+      Timeout: 30
+
+  FibonacciPowertoolsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      InlineCode: |
+        const { Logger } = require('@aws-lambda-powertools/logger');
+
+        const logger = new Logger({
+          serviceName: 'fibonacciService',
+          logLevel: 'INFO'
+        });
+
+        const calculateFibonacci = (n) => {
+          if (n <= 1) return n;
+          return calculateFibonacci(n - 1) + calculateFibonacci(n - 2);
+        };
+
+        exports.handler = async (event) => {
+          // Add correlation ids from Lambda context
+          logger.addContext(event);
+
+          // Get parameters from event
+          const number = event.number || 0;
+          const userName = event.userName || 'anonymous';
+          
+          // Structured logging of the event
+          logger.info('Processing fibonacci request', {
+            userName,
+            number,
+            timestamp: new Date().toISOString(),
+          });
+          
+          // Validate input
+          if (number < 0) {
+            const errorMessage = `User ${userName} requested Fibonacci of negative number: ${number}`;
+            logger.error(errorMessage, { userName, number });
+            throw new Error(errorMessage);
+          }
+          
+          // Sleep for 1 second
+          logger.debug('Sleeping for 1 second');
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Calculate fibonacci
+          logger.debug('Calculating fibonacci', { number });
+          const result = calculateFibonacci(number);
+          
+          // Log success with structured data
+          logger.info('Fibonacci calculation completed', {
+            userName,
+            input: number,
+            result,
+            duration: '1000ms', // We know it's 1s because of the sleep
+          });
+          
+          // Clear memory
+          memoryArray.length = 0;
+          
+          return {
+            statusCode: 200,
+            body: JSON.stringify({
+              userName,
+              input: number,
+              fibonacci: result
+            })
+          };
+        };
+      Description: A Lambda function that calculates Fibonacci numbers with Powertools logging
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: fibonacciService
+          LOG_LEVEL: INFO
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:094274105915:layer:AWSLambdaPowertoolsTypeScriptV2:17
+
+  InvokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      InlineCode: |
+        const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+        const lambda = new LambdaClient();
+        
+        exports.handler = async (event) => {
+          const results = {
+            standard: [],
+            powertools: []
+          };
+          const userNames = ['alice', 'bob', 'charlie', 'dave'];
+          
+          // Invoke both Fibonacci functions 50 times sequentially
+          for (let i = 0; i < 50; i++) {
+            const number = Math.floor(Math.random() * 21) - 10; // Random number between -10 and 10
+            const userName = userNames[Math.floor(Math.random() * userNames.length)];
+            const payload = Buffer.from(JSON.stringify({
+              number,
+              userName
+            }));
+
+            // Standard Fibonacci function invocation
+            const standardCommand = new InvokeCommand({
+              FunctionName: process.env.FIBONACCI_FUNCTION_ARN,
+              InvocationType: 'RequestResponse',
+              Payload: payload
+            });
+
+            // Powertools Fibonacci function invocation
+            const powertoolsCommand = new InvokeCommand({
+              FunctionName: process.env.FIBONACCI_POWERTOOLS_FUNCTION_ARN,
+              InvocationType: 'RequestResponse',
+              Payload: payload
+            });
+            
+            try {
+              console.log(`Invoking calculation ${i + 1}/50 for number ${number}`);
+              
+              // Invoke standard function
+              const standardResponse = await lambda.send(standardCommand);
+              const standardPayload = JSON.parse(new TextDecoder().decode(standardResponse.Payload));
+              results.standard.push({
+                invocation: i + 1,
+                number,
+                userName,
+                response: standardPayload
+              });
+
+              // Invoke powertools function
+              const powertoolsResponse = await lambda.send(powertoolsCommand);
+              const powertoolsPayload = JSON.parse(new TextDecoder().decode(powertoolsResponse.Payload));
+              results.powertools.push({
+                invocation: i + 1,
+                number,
+                userName,
+                response: powertoolsPayload
+              });
+
+            } catch (error) {
+              console.log(`Error in invocation ${i + 1}:`, error);
+              results.standard.push({
+                invocation: i + 1,
+                number,
+                userName,
+                error: error.message
+              });
+              results.powertools.push({
+                invocation: i + 1,
+                number,
+                userName,
+                error: error.message
+              });
+            }
+          }
+          
+          return {
+            statusCode: 200,
+            body: JSON.stringify(results)
+          };
+        };
+      Description: A Lambda function that invokes the Fibonacci function 50 times
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          FIBONACCI_FUNCTION_ARN: !GetAtt FibonacciFunction.Arn
+          FIBONACCI_POWERTOOLS_FUNCTION_ARN: !GetAtt FibonacciPowertoolsFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: 
+                - !GetAtt FibonacciFunction.Arn
+                - !GetAtt FibonacciPowertoolsFunction.Arn
+      
+Outputs:
+  FibonacciFunction:
+    Description: Fibonacci Lambda Function ARN
+    Value: !GetAtt FibonacciFunction.Arn
+  
+  FibonacciPowertoolsFunction:
+    Description: Fibonacci Powertools Lambda Function ARN
+    Value: !GetAtt FibonacciPowertoolsFunction.Arn
+  
+  InvokerFunction:
+    Description: Invoker Lambda Function ARN
+    Value: !GetAtt InvokerFunction.Arn
