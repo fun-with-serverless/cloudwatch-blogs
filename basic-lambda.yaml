@@ -71,9 +71,9 @@ Resources:
           return calculateFibonacci(n - 1) + calculateFibonacci(n - 2);
         };
 
-        exports.handler = async (event) => {
+        exports.handler = async (event, context) => {
           // Add correlation ids from Lambda context
-          logger.addContext(event);
+          logger.addContext(context);
 
           // Get parameters from event
           const number = event.number || 0;
