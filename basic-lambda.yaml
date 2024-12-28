@@ -23,7 +23,6 @@ Resources:
           if (number < 0) {
             const errorMessage = `User ${userName} requested Fibonacci of negative number: ${number}`;
             console.error(errorMessage);
-            throw new Error(errorMessage);
           }
           
           // Sleep for 1 second
@@ -40,7 +39,6 @@ Resources:
           // Log and return the result
           console.log('Calculated Fibonacci result:', result);
           
-          // Clear memory
           
           return {
             statusCode: 200,
@@ -90,9 +88,8 @@ Resources:
           
           // Validate input
           if (number < 0) {
-            const errorMessage = `User ${userName} requested Fibonacci of negative number: ${number}`;
+            const errorMessage = 'User requested Fibonacci of negative number';
             logger.error(errorMessage, { userName, number });
-            throw new Error(errorMessage);
           }
           
           // Sleep for 1 second
@@ -108,11 +105,8 @@ Resources:
             userName,
             input: number,
             result,
-            duration: '1000ms', // We know it's 1s because of the sleep
           });
           
-          // Clear memory
-          memoryArray.length = 0;
           
           return {
             statusCode: 200,
@@ -211,10 +205,10 @@ Resources:
               });
             }
           }
-          
+          console.log('All invocations completed', JSON.stringify(results));
           return {
             statusCode: 200,
-            body: JSON.stringify(results)
+            body: 'Success'
           };
         };
       Description: A Lambda function that invokes the Fibonacci function 50 times
