@@ -10,13 +10,14 @@ Parameters:
 Globals:
   Function:
     Runtime: nodejs22.x
-    Timeout: 10
+    Timeout: 30
     MemorySize: 128
 
 Resources:
   DataTable:
     Type: AWS::DynamoDB::Table
     Properties:
+      TableName: !Sub ${AWS::StackName}-data
       AttributeDefinitions:
         - AttributeName: userId
           AttributeType: S
@@ -44,7 +45,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DataTable
-        - SQSPollerPolicy:
+        - SQSSendMessagePolicy:
             QueueName: !GetAtt ProcessingQueue.QueueName
       Events:
         ApiEvent:
@@ -53,14 +54,14 @@ Resources:
             Path: /process
             Method: post
       InlineCode: |
-        import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
-        import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
-        import { marshall } from '@aws-sdk/util-dynamodb';
+        const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+        const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+        const { marshall } = require('@aws-sdk/util-dynamodb');
 
         const dynamodb = new DynamoDBClient();
         const sqs = new SQSClient();
 
-        export const handler = async (event) => {
+        exports.handler = async (event) => {
             try {
                 const body = JSON.parse(event.body);
                 const { userId, data } = body;
@@ -80,7 +81,6 @@ Resources:
                     requestContext: event.requestContext
                 };
 
-                // Create DynamoDB error based on ERROR_RATE
                 const shouldError = Math.random() < parseFloat(process.env.ERROR_RATE);
                 const putCommand = new PutItemCommand({
                     TableName: process.env.TABLE_NAME,
@@ -129,7 +129,7 @@ Resources:
             Queue: !GetAtt ProcessingQueue.Arn
             BatchSize: 1
       InlineCode: |
-        export const handler = async (event) => {
+        exports.handler = async (event) => {
             for (const record of event.Records) {
                 try {
                     const message = JSON.parse(record.body);
@@ -159,49 +159,31 @@ Resources:
                 - execute-api:Invoke
               Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/*/*/*
       InlineCode: |
-        import https from 'https';
-
-        export const handler = async (event) => {
-            const makeRequest = () => {
-                return new Promise((resolve, reject) => {
-                    const testUser = {
-                        userId: `test-user-${Date.now()}`,
-                        data: {
-                            timestamp: new Date().toISOString(),
-                            message: 'Test request'
-                        }
-                    };
-
-                    const options = {
-                        hostname: process.env.API_ENDPOINT.replace('https://', ''),
-                        path: '/process',
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        }
-                    };
-
-                    const req = https.request(options, (res) => {
-                        let data = '';
-                        res.on('data', (chunk) => data += chunk);
-                        res.on('end', () => {
-                            try {
-                                resolve({ 
-                                    statusCode: res.statusCode,
-                                    data: JSON.parse(data)
-                                });
-                            } catch (error) {
-                                reject(error);
-                            }
-                        });
-                    });
-
-                    req.on('error', reject);
-                    req.write(JSON.stringify(testUser));
-                    req.end();
-                });
+        const makeRequest = async () => {
+            const testUser = {
+                userId: `test-user-${Date.now()}`,
+                data: {
+                    timestamp: new Date().toISOString(),
+                    message: 'Test request'
+                }
             };
 
+            const response = await fetch(`${process.env.API_ENDPOINT}/process`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(testUser)
+            });
+
+            const data = await response.json();
+            return {
+                statusCode: response.status,
+                data
+            };
+        };
+
+        exports.handler = async (event) => {
             const results = [];
             for (let i = 0; i < 50; i++) {
                 try {
@@ -210,16 +192,19 @@ Resources:
                     await new Promise(resolve => setTimeout(resolve, 100));
                 } catch (error) {
                     console.error(`Request ${i + 1} failed:`, error);
-                    results.push({ error: error.message });
+                    results.push({ 
+                        error: error.message,
+                        timestamp: new Date().toISOString()
+                    });
                 }
             }
 
             return {
                 statusCode: 200,
-                body: JSON.stringify({
+                body: {
                     message: 'Test completed',
                     results
-                })
+                }
             };
         };
 
