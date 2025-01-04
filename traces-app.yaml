@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  ErrorRate:
+    Type: Number
+    Default: 0.3
+    Description: Probability of generating a DynamoDB error (0-1)
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+
+  ServiceAFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DataTable
+          QUEUE_URL: !Ref ProcessingQueue
+          ERROR_RATE: !Ref ErrorRate
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /process
+            Method: post
+      InlineCode: |
+        import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
+        import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+        import { marshall } from '@aws-sdk/util-dynamodb';
+
+        const dynamodb = new DynamoDBClient();
+        const sqs = new SQSClient();
+
+        export const handler = async (event) => {
+            try {
+                const body = JSON.parse(event.body);
+                const { userId, data } = body;
+                
+                if (!userId) {
+                    return {
+                        statusCode: 400,
+                        body: JSON.stringify({ error: 'userId is required' })
+                    };
+                }
+
+                const timestamp = new Date().toISOString();
+                const item = {
+                    userId,
+                    timestamp,
+                    data,
+                    requestContext: event.requestContext
+                };
+
+                // Create DynamoDB error based on ERROR_RATE
+                const shouldError = Math.random() < parseFloat(process.env.ERROR_RATE);
+                const putCommand = new PutItemCommand({
+                    TableName: process.env.TABLE_NAME,
+                    Item: shouldError ? 
+                        marshall({
+                            timestamp,
+                            data
+                        }) :
+                        marshall(item)
+                });
+
+                await dynamodb.send(putCommand);
+
+                const sqsCommand = new SendMessageCommand({
+                    QueueUrl: process.env.QUEUE_URL,
+                    MessageBody: JSON.stringify(item)
+                });
+                await sqs.send(sqsCommand);
+
+                return {
+                    statusCode: 200,
+                    body: JSON.stringify({
+                        message: 'Data processed successfully',
+                        timestamp
+                    })
+                };
+            } catch (error) {
+                console.error('Error:', error);
+                return {
+                    statusCode: 500,
+                    body: JSON.stringify({
+                        error: error.message
+                    })
+                };
+            }
+        };
+
+  ServiceBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 1
+      InlineCode: |
+        export const handler = async (event) => {
+            for (const record of event.Records) {
+                try {
+                    const message = JSON.parse(record.body);
+                    console.log('Processing message:', message);
+                    
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    
+                    console.log('Message processed successfully:', message);
+                } catch (error) {
+                    console.error('Error processing message:', error);
+                    throw error;
+                }
+            }
+        };
+
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Environment:
+        Variables:
+          API_ENDPOINT: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:Invoke
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/*/*/*
+      InlineCode: |
+        import https from 'https';
+
+        export const handler = async (event) => {
+            const makeRequest = () => {
+                return new Promise((resolve, reject) => {
+                    const testUser = {
+                        userId: `test-user-${Date.now()}`,
+                        data: {
+                            timestamp: new Date().toISOString(),
+                            message: 'Test request'
+                        }
+                    };
+
+                    const options = {
+                        hostname: process.env.API_ENDPOINT.replace('https://', ''),
+                        path: '/process',
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        }
+                    };
+
+                    const req = https.request(options, (res) => {
+                        let data = '';
+                        res.on('data', (chunk) => data += chunk);
+                        res.on('end', () => {
+                            try {
+                                resolve({ 
+                                    statusCode: res.statusCode,
+                                    data: JSON.parse(data)
+                                });
+                            } catch (error) {
+                                reject(error);
+                            }
+                        });
+                    });
+
+                    req.on('error', reject);
+                    req.write(JSON.stringify(testUser));
+                    req.end();
+                });
+            };
+
+            const results = [];
+            for (let i = 0; i < 50; i++) {
+                try {
+                    const result = await makeRequest();
+                    results.push(result);
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                } catch (error) {
+                    console.error(`Request ${i + 1} failed:`, error);
+                    results.push({ error: error.message });
+                }
+            }
+
+            return {
+                statusCode: 200,
+                body: JSON.stringify({
+                    message: 'Test completed',
+                    results
+                })
+            };
+        };
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+  TestFunction:
+    Description: Test Function Name
+    Value: !Ref TestFunction
