@@ -36,6 +36,7 @@ Resources:
   ServiceAFunction:
     Type: AWS::Serverless::Function
     Properties:
+      Tracing: Active
       Handler: index.handler
       Environment:
         Variables:
@@ -47,6 +48,8 @@ Resources:
             TableName: !Ref DataTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ProcessingQueue.QueueName
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:094274105915:layer:AWSLambdaPowertoolsTypeScriptV2:17
       Events:
         ApiEvent:
           Type: Api
@@ -57,9 +60,12 @@ Resources:
         const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
         const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
         const { marshall } = require('@aws-sdk/util-dynamodb');
+        const { Tracer } = require('@aws-lambda-powertools/tracer');
 
-        const dynamodb = new DynamoDBClient();
-        const sqs = new SQSClient();
+        const tracer = new Tracer({ serviceName: 'ServiceA' });
+
+        const dynamodb = tracer.captureAWSv3Client(new DynamoDBClient());
+        const sqs = tracer.captureAWSv3Client(new SQSClient());
 
         exports.handler = async (event) => {
             try {
@@ -121,7 +127,10 @@ Resources:
   ServiceBFunction:
     Type: AWS::Serverless::Function
     Properties:
+      Tracing: Active
       Handler: index.handler
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:094274105915:layer:AWSLambdaPowertoolsTypeScriptV2:17
       Events:
         SQSEvent:
           Type: SQS
