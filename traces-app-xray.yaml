@@ -9,9 +9,10 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: nodejs22.x
     Timeout: 30
     MemorySize: 128
+  Api:
+    TracingEnabled: true
 
 Resources:
   DataTable:
@@ -37,19 +38,21 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Tracing: Active
+      Runtime: python3.13
       Handler: index.handler
       Environment:
         Variables:
           TABLE_NAME: !Ref DataTable
           QUEUE_URL: !Ref ProcessingQueue
           ERROR_RATE: !Ref ErrorRate
+          POWERTOOLS_SERVICE_NAME: ServiceA
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DataTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ProcessingQueue.QueueName
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:094274105915:layer:AWSLambdaPowertoolsTypeScriptV2:17
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:5
       Events:
         ApiEvent:
           Type: Api
@@ -57,80 +60,105 @@ Resources:
             Path: /process
             Method: post
       InlineCode: |
-        const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
-        const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
-        const { marshall } = require('@aws-sdk/util-dynamodb');
-        const { Tracer } = require('@aws-lambda-powertools/tracer');
+        import json
+        import os
+        import boto3
+        from datetime import datetime
+        from typing import Dict, Any
+        from random import random
+        from aws_lambda_powertools import Tracer
+        from aws_lambda_powertools import Logger
 
-        const tracer = new Tracer({ serviceName: 'ServiceA' });
 
-        const dynamodb = tracer.captureAWSv3Client(new DynamoDBClient());
-        const sqs = tracer.captureAWSv3Client(new SQSClient());
+        tracer = Tracer()
+        logger = Logger()
 
-        exports.handler = async (event) => {
-            try {
-                const body = JSON.parse(event.body);
-                const { userId, data } = body;
+
+        dynamodb = boto3.client('dynamodb')
+        sqs = boto3.client('sqs')
+
+        @tracer.capture_lambda_handler
+        def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+            try:
+                # Parse the request body
+                body = json.loads(event['body'])
+                user_id = body.get('userId')
+                data = body.get('data')
                 
-                if (!userId) {
+                tracer.put_annotation(key="userId", value=user_id)
+                # Validate required fields
+                if not user_id:
                     return {
-                        statusCode: 400,
-                        body: JSON.stringify({ error: 'userId is required' })
-                    };
+                        'statusCode': 400,
+                        'body': json.dumps({'error': 'userId is required'})
+                    }
+                
+                # Create item with current timestamp
+                timestamp = datetime.now().isoformat()
+                item = {
+                    'userId': {'S': user_id},
+                    'timestamp': {'S': timestamp},
+                    'data': {'S': json.dumps(data)},
+                    'requestContext': {'S': json.dumps(event.get('requestContext', {}))}
                 }
-
-                const timestamp = new Date().toISOString();
-                const item = {
-                    userId,
-                    timestamp,
-                    data,
-                    requestContext: event.requestContext
-                };
-
-                const shouldError = Math.random() < parseFloat(process.env.ERROR_RATE);
-                const putCommand = new PutItemCommand({
-                    TableName: process.env.TABLE_NAME,
-                    Item: shouldError ? 
-                        marshall({
-                            timestamp,
-                            data
-                        }) :
-                        marshall(item)
-                });
-
-                await dynamodb.send(putCommand);
-
-                const sqsCommand = new SendMessageCommand({
-                    QueueUrl: process.env.QUEUE_URL,
-                    MessageBody: JSON.stringify(item)
-                });
-                await sqs.send(sqsCommand);
-
-                return {
-                    statusCode: 200,
-                    body: JSON.stringify({
-                        message: 'Data processed successfully',
-                        timestamp
+                
+                # Simulate error based on environment variable
+                error_rate = float(os.environ.get('ERROR_RATE', '0'))
+                should_error = random() < error_rate
+                
+                # Prepare DynamoDB item
+                dynamo_item = {
+                    'timestamp': {'S': timestamp},
+                    'data': {'S': json.dumps(data)}
+                } if should_error else item
+                
+                tracer.put_metadata(key="db_item", value=dynamo_item)
+                # Store in DynamoDB
+                dynamodb.put_item(
+                    TableName=os.environ['TABLE_NAME'],
+                    Item=dynamo_item
+                )
+                
+                # Send to SQS
+                sqs.send_message(
+                    QueueUrl=os.environ['QUEUE_URL'],
+                    MessageBody=json.dumps({
+                        'userId': user_id,
+                        'timestamp': timestamp,
+                        'data': data,
+                        'requestContext': event.get('requestContext', {})
                     })
-                };
-            } catch (error) {
-                console.error('Error:', error);
+                )
+                
                 return {
-                    statusCode: 500,
-                    body: JSON.stringify({
-                        error: error.message
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Data processed successfully',
+                        'timestamp': timestamp
                     })
-                };
-            }
-        };
+                }
+                
+            except Exception as error:
+                logger.error(f'Error: {str(error)}')
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'error': str(error)
+                    })
+                }
 
   ServiceBFunction:
     Type: AWS::Serverless::Function
     Properties:
+      Runtime: python3.13
       Tracing: Active
       Handler: index.handler
+      Environment:
+        Variables:
+          ERROR_RATE: !Ref ErrorRate
+          POWERTOOLS_SERVICE_NAME: ServiceB
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:094274105915:layer:AWSLambdaPowertoolsTypeScriptV2:17
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:5
       Events:
         SQSEvent:
           Type: SQS
@@ -138,26 +166,36 @@ Resources:
             Queue: !GetAtt ProcessingQueue.Arn
             BatchSize: 1
       InlineCode: |
-        exports.handler = async (event) => {
-            for (const record of event.Records) {
-                try {
-                    const message = JSON.parse(record.body);
-                    console.log('Processing message:', message);
-                    
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    
-                    console.log('Message processed successfully:', message);
-                } catch (error) {
-                    console.error('Error processing message:', error);
-                    throw error;
-                }
-            }
-        };
+        import json
+        import time
+        from typing import Dict, Any
+        from random import random
+        import os
+        from aws_lambda_powertools import Tracer
+
+        tracer = Tracer()
+
+        @tracer.capture_lambda_handler
+        def handler(event: Dict[str, Any], context: Any) -> None:
+          for record in event['Records']:
+            message = json.loads(record['body'])
+            print('Processing message:', message)
+            
+            time.sleep(0.1)
+            # Simulate error based on environment variable
+            error_rate = float(os.environ.get('ERROR_RATE', '0'))
+            should_error = random() < error_rate
+            if should_error:
+                raise Exception('Failed parsing message')
+            
+            print('Message processed successfully:', message)
+                
 
   TestFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: index.handler
+      Runtime: nodejs22.x
       Environment:
         Variables:
           API_ENDPOINT: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
