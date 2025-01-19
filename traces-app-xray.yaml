@@ -33,6 +33,13 @@ Resources:
 
   ProcessingQueue:
     Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingQueueDLQ.Arn
+        maxReceiveCount: 1
+  
+  ProcessingQueueDLQ:
+    Type: AWS::SQS::Queue
 
   ServiceAFunction:
     Type: AWS::Serverless::Function
@@ -172,23 +179,24 @@ Resources:
         from random import random
         import os
         from aws_lambda_powertools import Tracer
+        from aws_lambda_powertools import Logger
 
         tracer = Tracer()
+        logger = Logger()
 
         @tracer.capture_lambda_handler
         def handler(event: Dict[str, Any], context: Any) -> None:
           for record in event['Records']:
             message = json.loads(record['body'])
-            print('Processing message:', message)
+            logger.info(f'Processing message: {message}')
+            tracer.put_annotation(key="userId", value=message["userId"])
+            tracer.put_metadata(key="input", value=message)
+
+            if message["data"]["message"] != "run":
+              logger.error(f'Action is invalid: {message["data"]["message"]}')
+              raise Exception("Invalid action")
             
-            time.sleep(0.1)
-            # Simulate error based on environment variable
-            error_rate = float(os.environ.get('ERROR_RATE', '0'))
-            should_error = random() < error_rate
-            if should_error:
-                raise Exception('Failed parsing message')
-            
-            print('Message processed successfully:', message)
+            logger.info('Message processed successfully')
                 
 
   TestFunction:
@@ -208,10 +216,10 @@ Resources:
       InlineCode: |
         const makeRequest = async () => {
             const testUser = {
-                userId: `test-user-${Date.now()}`,
+                userId: 'Moshe',
                 data: {
                     timestamp: new Date().toISOString(),
-                    message: 'Test request'
+                    message: Math.random() < 0.7 ? 'Run' : "Ran"
                 }
             };
 
