@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  ErrorRate:
+    Type: Number
+    Default: 0.3
+    Description: Probability of generating a DynamoDB error (0-1)
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+  Api:
+    TracingEnabled: true
+
+Resources:
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-data
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingQueueDLQ.Arn
+        maxReceiveCount: 1
+  
+  ProcessingQueueDLQ:
+    Type: AWS::SQS::Queue
+
+  ServiceAFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Tracing: Active
+      Runtime: python3.13
+      Handler: index.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DataTable
+          QUEUE_URL: !Ref ProcessingQueue
+          ERROR_RATE: !Ref ErrorRate
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-amd64-ver-1-29-0:1
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:5
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /process
+            Method: post
+      InlineCode: |
+        import json
+        import os
+        import boto3
+        from datetime import datetime
+        from typing import Dict, Any
+        from random import random
+        from aws_lambda_powertools import Logger
+
+        logger = Logger()
+
+        dynamodb = boto3.client('dynamodb')
+        sqs = boto3.client('sqs')
+
+        def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+            try:
+                # Parse the request body
+                body = json.loads(event['body'])
+                user_id = body.get('userId')
+                data = body.get('data')
+                
+                # Validate required fields
+                if not user_id:
+                    return {
+                        'statusCode': 400,
+                        'body': json.dumps({'error': 'userId is required'})
+                    }
+                
+                # Create item with current timestamp
+                timestamp = datetime.now().isoformat()
+                item = {
+                    'userId': {'S': user_id},
+                    'timestamp': {'S': timestamp},
+                    'data': {'S': json.dumps(data)},
+                    'requestContext': {'S': json.dumps(event.get('requestContext', {}))}
+                }
+                
+                # Simulate error based on environment variable
+                error_rate = float(os.environ.get('ERROR_RATE', '0'))
+                should_error = random() < error_rate
+                
+                # Prepare DynamoDB item
+                dynamo_item = {
+                    'timestamp': {'S': timestamp},
+                    'data': {'S': json.dumps(data)}
+                } if should_error else item
+                
+                # Store in DynamoDB
+                dynamodb.put_item(
+                    TableName=os.environ['TABLE_NAME'],
+                    Item=dynamo_item
+                )
+                
+                # Send to SQS
+                sqs.send_message(
+                    QueueUrl=os.environ['QUEUE_URL'],
+                    MessageBody=json.dumps({
+                        'userId': user_id,
+                        'timestamp': timestamp,
+                        'data': data,
+                        'requestContext': event.get('requestContext', {})
+                    })
+                )
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Data processed successfully',
+                        'timestamp': timestamp
+                    })
+                }
+                
+            except Exception as error:
+                logger.error(f'Error: {str(error)}')
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'error': str(error)
+                    })
+                }
+
+  ServiceBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      Tracing: Active
+      Handler: index.handler
+      Environment:
+        Variables:
+          ERROR_RATE: !Ref ErrorRate
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-amd64-ver-1-29-0:1
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:5
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 1
+      InlineCode: |
+        import json
+        import time
+        from typing import Dict, Any
+        from random import random
+        import os
+        from aws_lambda_powertools import Logger
+
+        logger = Logger()
+
+        def handler(event: Dict[str, Any], context: Any) -> None:
+          for record in event['Records']:
+            message = json.loads(record['body'])
+            logger.info(f'Processing message: {message}')
+
+            if message["data"]["message"] != "run":
+              logger.error(f'Action is invalid: {message["data"]["message"]}')
+              raise Exception("Invalid action")
+            
+            logger.info('Message processed successfully')
+                
+
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          API_ENDPOINT: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:Invoke
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessRestApi}/*/*/*
+      InlineCode: |
+        const makeRequest = async () => {
+            const testUser = {
+                userId: 'Moshe',
+                data: {
+                    timestamp: new Date().toISOString(),
+                    message: Math.random() < 0.7 ? 'Run' : "Ran"
+                }
+            };
+
+            const response = await fetch(`${process.env.API_ENDPOINT}/process`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(testUser)
+            });
+
+            const data = await response.json();
+            return {
+                statusCode: response.status,
+                data
+            };
+        };
+
+        exports.handler = async (event) => {
+            const results = [];
+            for (let i = 0; i < 50; i++) {
+                try {
+                    const result = await makeRequest();
+                    results.push(result);
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                } catch (error) {
+                    console.error(`Request ${i + 1} failed:`, error);
+                    results.push({ 
+                        error: error.message,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            }
+
+            return {
+                statusCode: 200,
+                body: {
+                    message: 'Test completed',
+                    results
+                }
+            };
+        };
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+  TestFunction:
+    Description: Test Function Name
+    Value: !Ref TestFunction
